@@ -1,0 +1,552 @@
+openapi: 3.0.3
+info:
+  title: Amrutam Telemedicine Backend API
+  description: >
+    Production-grade backend API for Amrutam's Telemedicine System.
+    Engineered for high-throughput (100k daily consultations), concurrency-safe slot bookings,
+    non-negotiable idempotency, HIPAA-compliant medical data encryption (AES-256-GCM), and full observability.
+  version: 1.0.0
+  contact:
+    name: Amrutam Engineering Team
+    url: https://amrutam.co
+servers:
+  - url: http://localhost:4000/api/v1
+    description: Local Development / Docker Environment
+
+paths:
+  /auth/register:
+    post:
+      summary: Register a new patient, doctor, or admin
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered successfully with JWT tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+
+  /auth/login:
+    post:
+      summary: Authenticate user credentials
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /auth/me:
+    get:
+      summary: Get current authenticated user profile
+      tags: [Authentication]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Current user profile
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /doctors:
+    get:
+      summary: Search and filter doctors
+      tags: [Doctors]
+      parameters:
+        - name: specialization
+          in: query
+          schema:
+            type: string
+          description: Filter by clinical specialization
+        - name: minRating
+          in: query
+          schema:
+            type: number
+          description: Minimum rating threshold
+        - name: maxFee
+          in: query
+          schema:
+            type: number
+          description: Maximum consultation fee
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Search term across doctor name and specialty
+      responses:
+        '200':
+          description: List of matched doctors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  count:
+                    type: integer
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Doctor'
+
+  /doctors/{id}:
+    get:
+      summary: Get doctor profile details by ID
+      tags: [Doctors]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Doctor details
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /slots:
+    post:
+      summary: Publish availability slots (Doctor / Admin only)
+      tags: [Availability]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateSlotsRequest'
+      responses:
+        '201':
+          description: Slots created successfully
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+
+  /slots/available:
+    get:
+      summary: Query available slots for a doctor
+      tags: [Availability]
+      parameters:
+        - name: doctorId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: fromDate
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: toDate
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Available slots for booking
+
+  /bookings:
+    post:
+      summary: Concurrency-safe slot reservation (Patient only)
+      tags: [Bookings]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Unique client token ensuring atomic, duplicate-free booking execution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Slot reserved; consultation created in PENDING status
+          headers:
+            X-Idempotency-Status:
+              schema:
+                type: string
+                enum: [PROCESSED, REPLAYED]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingResponse'
+        '409':
+          description: Slot already booked or request key currently in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      summary: List consultations for authenticated user
+      tags: [Bookings]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of user consultations
+
+  /bookings/{id}:
+    get:
+      summary: Get consultation details by ID (Audit logged)
+      tags: [Bookings]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Consultation details with decrypted symptoms
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+
+  /bookings/{id}/status:
+    patch:
+      summary: Update consultation lifecycle status (Doctor only)
+      tags: [Bookings]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [IN_PROGRESS, COMPLETED, CANCELLED]
+                doctorNotes:
+                  type: string
+      responses:
+        '200':
+          description: Status updated
+
+  /payments/process:
+    post:
+      summary: Process payment capture and confirm booking saga
+      tags: [Payments]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProcessPaymentRequest'
+      responses:
+        '200':
+          description: Payment succeeded; booking confirmed
+        '402':
+          description: Payment failed; slot released back via saga rollback
+
+  /prescriptions:
+    post:
+      summary: Issue digital prescription with encryption & digital signature (Doctor only)
+      tags: [Prescriptions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePrescriptionRequest'
+      responses:
+        '201':
+          description: Digital prescription issued
+
+  /prescriptions/consultation/{consultationId}:
+    get:
+      summary: Read prescription for consultation (Audit logged)
+      tags: [Prescriptions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: consultationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Prescription with decrypted diagnosis
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+
+  /analytics/dashboard:
+    get:
+      summary: System metrics and consultation analytics (Admin only)
+      tags: [Analytics]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: System volume, revenue, and active doctor metrics
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    RegisterRequest:
+      type: object
+      required: [email, password, fullName]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        role:
+          type: string
+          enum: [PATIENT, DOCTOR, ADMIN]
+          default: PATIENT
+        fullName:
+          type: string
+        phone:
+          type: string
+        specialization:
+          type: string
+        experienceYears:
+          type: integer
+        consultationFee:
+          type: number
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    AuthResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        data:
+          type: object
+          properties:
+            user:
+              type: object
+            tokens:
+              type: object
+              properties:
+                accessToken:
+                  type: string
+                refreshToken:
+                  type: string
+
+    Doctor:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        fullName:
+          type: string
+        specialization:
+          type: string
+        experienceYears:
+          type: integer
+        consultationFee:
+          type: number
+        rating:
+          type: number
+
+    GenerateSlotsRequest:
+      type: object
+      required: [date]
+      properties:
+        date:
+          type: string
+          example: '2026-10-25'
+        startHour:
+          type: integer
+          default: 9
+        endHour:
+          type: integer
+          default: 17
+        slotDurationMinutes:
+          type: integer
+          default: 30
+
+    CreateBookingRequest:
+      type: object
+      required: [slotId, symptoms]
+      properties:
+        slotId:
+          type: string
+          format: uuid
+        symptoms:
+          type: string
+
+    BookingResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        data:
+          type: object
+          properties:
+            consultation:
+              type: object
+            payment:
+              type: object
+            slot:
+              type: object
+
+    ProcessPaymentRequest:
+      type: object
+      required: [consultationId]
+      properties:
+        consultationId:
+          type: string
+          format: uuid
+        paymentMethod:
+          type: string
+          enum: [UPI, CARD, NETBANKING, WALLET]
+          default: UPI
+        simulateFailure:
+          type: boolean
+          default: false
+
+    CreatePrescriptionRequest:
+      type: object
+      required: [consultationId, diagnosis, medications]
+      properties:
+        consultationId:
+          type: string
+          format: uuid
+        diagnosis:
+          type: string
+        medications:
+          type: array
+          items:
+            type: object
+            required: [name, dosage, frequency, durationDays]
+            properties:
+              name:
+                type: string
+              dosage:
+                type: string
+              frequency:
+                type: string
+              durationDays:
+                type: integer
+              instructions:
+                type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            requestId:
+              type: string
+            timestamp:
+              type: string
+
+  responses:
+    ValidationError:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnauthorizedError:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ForbiddenError:
+      description: Access forbidden
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ConflictError:
+      description: Resource conflict or double-booking
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
